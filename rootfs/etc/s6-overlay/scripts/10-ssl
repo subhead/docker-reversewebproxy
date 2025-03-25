@@ -1,0 +1,158 @@
+#!/command/with-contenv bash
+#shellcheck shell=bash disable=SC2145,SC2076,SC1091,SC2154,SC2015
+
+source /scripts/common
+
+"${s6wrap[@]}" echo "Started SSL initialization"
+
+rm -f /run/.ssl-enabled
+
+# If SSL is not ENABLED, stop forevah
+if ! chk_enabled "${SSL}"; then
+    "${s6wrap[@]}" echo "SSL disabled. No initialization needed."
+    exit 0
+fi
+
+# First let's check if there's a backup. This backup contains the latest, so let's make sure it's installed
+# If /root/letsencrypt-force-reinstall exists, then there were some BREAKING changing to the container that
+# necesitate a container update. This file will contain a date (secs since epoch). If the last forced reinstall was
+# earlier than this date, then don't restore any backups
+
+forceinstall="false"
+[[ -f /run/nginx/.letsencrypt/.force-reinstall.lastforced ]] && read -r lastforced < /run/nginx/.letsencrypt/.force-reinstall.lastforced || lastforced=0
+if [[ -f /root/letsencrypt-force-reinstall ]]
+then
+  read -r mustforce < /root/letsencrypt-force-reinstall
+  [[ -z "$mustforce" ]] && mustforce=0 || true
+  [[ -z "$lastforced" ]] && lastforced=0 || true
+  (( mustforce - lastforced > 0 )) && forceinstall="true" || true
+  date +%s > /run/nginx/.letsencrypt/.force-reinstall.lastforced
+  "${s6wrap[@]}" echo "Checking if SSL certificates must be reinstalled: Must reinstall if last install was before $(date -d "@$mustforce")."
+  "${s6wrap[@]}" echo "Last reinstall was at $(date -d "@$lastforced"). Will $(if [[ "$forceinstall" != "true" ]]; then printf "not "; fi)reinstall certificates."
+fi
+
+# if there is a backup and $forceinstall is not true, restore it
+if [[ -f /run/nginx/.letsencrypt/letsencrypt.tgz ]] && [[ "$forceinstall" != "true" ]]
+then
+    "${s6wrap[@]}" echo "Backup of certificates found. Restoring..."
+    tar --overwrite -xzf /run/nginx/.letsencrypt/letsencrypt.tgz -C /  >/dev/null 2>&1
+elif [[ -d /etc/letsencrypt ]]
+then
+    # If there's no backup but there is /etc/letsencrypt, then let's make sure it's backed up before we do anything else
+    mkdir -p /run/nginx/.letsencrypt
+    chmod u=rwx,go= /run/nginx/.letsencrypt
+    find /etc/letsencrypt /var/lib/letsencrypt /etc/nginx/sites-available/default* -print > /tmp/tarlist 2>/dev/null | true
+    tar -czf /run/nginx/.letsencrypt/letsencrypt.tgz -T /tmp/tarlist  >/dev/null 2>&1
+    rm /tmp/tarlist
+    chmod u=rx,go= /run/nginx/.letsencrypt
+fi
+
+# Just make sure that this file exists so `nginx -t` won't complain later on:
+touch /run/nginx/locations.conf
+
+# Do some checks to ensure that there is enough info to request domains:
+# shellcheck disable=SC2153
+if (( ${#SSL_DOMAIN[@]} == 0 ))
+then
+    # No domains in environment files. Complain and stop trying to install certificates:
+    "${s6wrap[@]}" echo "--------------------------------------------------"
+    "${s6wrap[@]}" echo "|    WARNING ! NGINX SSL configuration problem   |"
+    "${s6wrap[@]}" echo "| You must define at least 1 SSL_DOMAIN in your  |"
+    "${s6wrap[@]}" echo "| docker-compose.yml file. Go check and fix it!  |"
+    "${s6wrap[@]}" echo "| The container will continue without SSL.       |"
+    "${s6wrap[@]}" echo "--------------------------------------------------"
+    exit 0
+fi
+
+if ! grep -E "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}\b" <<< "$SSL_EMAIL" >/dev/null
+then
+    # No domains in environment files. Complain and stop trying to install certificates:
+    "${s6wrap[@]}" echo "--------------------------------------------------------"
+    "${s6wrap[@]}" echo "|       WARNING ! NGINX SSL configuration problem      |"
+    "${s6wrap[@]}" echo "| You must provide a valid email in SSL_EMAIL in your  |"
+    "${s6wrap[@]}" echo "| docker-compose.yml file. Go check and fix it!        |"
+    "${s6wrap[@]}" echo "| The container will continue without SSL.             |"
+    "${s6wrap[@]}" echo "--------------------------------------------------------"
+    exit 0
+fi
+
+if [[ "${SSL_TOS,,}" != "accept" ]]
+then
+    # No domains in environment files. Complain and stop trying to install certificates:
+    "${s6wrap[@]}" echo "--------------------------------------------------------------------------"
+    "${s6wrap[@]}" echo "|      WARNING ! NGINX SSL configuration problem                         |"
+    "${s6wrap[@]}" echo "| You must accept the ACME Account TOS found at                          |"
+    "${s6wrap[@]}" echo "| https://letsencrypt.org/repository/#let-s-encrypt-subscriber-agreement |"
+    "${s6wrap[@]}" echo "| and set SSL_TOS=ACCEPT in your docker-compose.yml file.                |"
+    "${s6wrap[@]}" echo "| Go check and fix it! The container will continue without SSL.          |"
+    "${s6wrap[@]}" echo "--------------------------------------------------------------------------"
+    exit 0
+else
+    agree_tos="--agree-tos"
+fi
+
+#[[ "${SSL_TEST}" != "" ]] && staging="--test-cert" || staging=""
+
+# Load up ${newdomains[@]} with any domain names there's not yet a certificate for
+newdomains=()
+#shellcheck disable=SC2207
+domains=($(/usr/bin/certbot certificates 2>/dev/null | awk '/Domains:/ { $1=""; print substr($0,2) }'))
+
+# shellcheck disable=SC2086
+IFS="," read -ra SSL_DOMAINS <<< "$(echo $SSL_DOMAIN|tr -d '[:blank:]')"
+for (( i=0; i<${#SSL_DOMAINS[@]}; i++ ))
+do
+    [[ ! " ${domains[*]} " =~ " ${SSL_DOMAINS[i]} " ]] && newdomains+=("${SSL_DOMAINS[i]}")
+done
+
+# Figure out if we want to redirect all queries to SSL?
+if chk_enabled "${SSL_REDIRECT}"; then
+    redirect="--redirect"
+else
+    redirect=""
+fi
+
+if (( ${#newdomains[@]} > 0 )); then 
+    "${s6wrap[@]}" echo "New domains detected - attempting to get certificates for ${newdomains[@]}"
+else
+    "${s6wrap[@]}" echo "No new domains detected"
+fi
+
+# prepend "-d " before each domain name:
+newdomains=( "${newdomains[@]/#/-d }" )
+
+# Now get new certs for these newdomains:
+#shellcheck disable=SC2068
+if (( ${#newdomains[@]} > 0 )) && ! /usr/bin/certbot run --quiet --nginx ${agree_tos} ${redirect} -m "${SSL_EMAIL}" ${newdomains[@]}
+then
+    # Something went wrong
+    echo Error in:
+    echo "/usr/bin/certbot run --quiet --nginx ${agree_tos} ${redirect} -m \"${SSL_EMAIL}\" ${newdomains[@]}"
+    "${s6wrap[@]}" echo "--------------------------------------------------"
+    "${s6wrap[@]}" echo "| STOP ! NGINX CertBot SSL installation problem  |"
+    "${s6wrap[@]}" echo "| Please see the error message above.            |"
+    "${s6wrap[@]}" echo "|                                                |"
+    "${s6wrap[@]}" echo "| The container will continue without SSL.       |"
+    "${s6wrap[@]}" echo "--------------------------------------------------"
+    exit 0
+else
+    "${s6wrap[@]}" echo "SSL Certificates installed for these domains:"
+    /usr/bin/certbot certificates
+    [[ "${SSL_REDIRECT,,}" == "enabled" ]] && "${s6wrap[@]}" echo "All web traffic will be redirected to SSL."
+
+    # back things up again, keep a copy of the previous TGZ if there was one:
+    mkdir -p /run/nginx/.letsencrypt
+    chmod u=rwx,go= /run/nginx/.letsencrypt
+
+    [[ -f /run/nginx/.letsencrypt/letsencrypt.tgz ]] && mv -f /run/nginx/.letsencrypt/letsencrypt.tgz /run/nginx/.letsencrypt/letsencrypt-backup.tgz
+
+    find /etc/letsencrypt /var/lib/letsencrypt /etc/nginx/sites-available/default* -print > /tmp/tarlist 2>/dev/null
+    tar -czf /run/nginx/.letsencrypt/letsencrypt.tgz -T /tmp/tarlist >/dev/null 2>&1
+    rm /tmp/tarlist
+    chmod u=rx,go= /run/nginx/.letsencrypt
+
+    touch /run/.ssl-enabled
+
+    "${s6wrap[@]}" echo "Nginx will start with SSL enabled."
+    "${s6wrap[@]}" echo "The container will check every 24 hours to see if the certificates need renewal."
+fi

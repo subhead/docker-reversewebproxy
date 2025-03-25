@@ -1,0 +1,96 @@
+#!/command/with-contenv bash
+#shellcheck shell=bash disable=SC2174,SC2154,SC1091
+
+source /scripts/common
+
+# First clean out the existing files
+rm -f /run/nginx/.htaccess/.htpasswd*
+
+if ! chk_enabled "${AUTH}"; then
+    # Global Authorization is not enabled, let's ensure that it's set to off
+    sed -i 's|^\s*#*\s*auth_basic .*$|        auth_basic off;|g' /etc/nginx/sites-available/default
+    sed -i 's|^\s*#*\s*auth_basic_user_file .*$|        # auth_basic_user_file /file/here;|g' /etc/nginx/sites-available/default
+
+    "${s6wrap[@]}" echo "Basic Authentication is not enabled. Continuing."
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------------------
+# Implement localized credentials for each of the REVPROXY entries
+# -----------------------------------------------------------------------------------------
+# Get the REVPROXY array and put each entry into am array element
+readarray -d ',' -t revproxy_array <<< "$REVPROXY"
+#
+# Loop through each of the entries in $revproxy_array:
+# Note -- enabling each entry in the locations.conf file was already done in 20-webproxy
+for proxy in "${revproxy_array[@]}"
+do
+    location="${proxy%%|*}"       # all chars up to the first "|"
+    location="${location//[[:space:]]}"     # strip any spaces
+    location="${location///}"     # strip any '/'
+    proxy="${proxy#*|}"           # all chars after the first "|"
+    destination="${proxy%%|*}"    # all chars up to the (now) first "|"
+    destination="${destination//[[:space:]]}" # strip any spaces
+    creds="${proxy#*|}"           # now there's only user1|pass1|user2|pass2 etc left
+    if ! grep -q '|' <<< "$creds"; then creds=""; fi   # If there are no '|' in the string, there is no user/pass
+    #debug: echo "Loc: ${location#* } - Proxy: $destination - Creds: $creds"
+    if [[ -n "${location}" ]]; then touch "/run/nginx/.htaccess/.htpasswd-${location}"; fi
+
+    if [[ -n "$creds" ]]
+    then
+        # Now loop through the credentials, create the password file:
+        while grep '|' <<< "$creds" >/dev/null 2>&1
+        do
+            username="${creds%%|*}"       # all chars up to the first "|"
+            username=${username//[[:space:]]}       # strip any spaces
+            creds="${creds#*|}"           # all chars after the first "|"
+            password="${creds%%|*}"       # all chars up to the (now) first "|"
+            password="${password//[[:space:]]}"     # strip any spaces
+            creds="${creds#*|}"           # now there's only the next user|pass|user|pass etc left
+            # note - if there is no more username|pass, then $creds will contain the last password but no '|'
+            # write credentials to password file:
+            printf "%s:%s\n" "$username" "$(openssl passwd -5 "$password")" >> "/run/nginx/.htaccess/.htpasswd-${location}"
+        done
+    fi
+done
+
+# -----------------------------------------------------------------------------------------
+# Implement global credentials
+
+if [[ -n "${LOCAL_CREDS}" ]]
+then
+    readarray -d ',' -t creds_array <<< "${LOCAL_CREDS}"
+    n=1
+    errors=0
+    # Add global credentials to the file if they exist:
+    for cred in "${creds_array[@]}"
+    do
+        username="${cred%%|*}"
+        password="${cred##*|}"
+        if [[ -z "$username" ]] || [[ -z "$password" ]]
+        then
+            "${s6wrap[@]}" echo "WARNING: Entry $n of CREDENTIALS variable is wrongly formatted. Skipping..."
+            (( errors++ )) || true
+            continue
+        fi
+        printf "%s:%s\n" "$username" "$(openssl passwd -5 "$password")" >> /run/nginx/.htaccess/.htpasswd_global
+        if chk_enabled "${LOCAL_CREDS_ALL_REVPROXIES}"; then
+            for f in /run/nginx/.htaccess/.htpasswd-*; do
+                if ! grep -q "$username" "$f"; then
+                    printf "%s:%s\n" "$username" "$(openssl passwd -5 "$password")" >> "$f"
+                fi
+            done
+        fi
+    done
+
+    # delete any empty left-over files
+    find /run/nginx/.htaccess/ -maxdepth 1 -type f -empty -delete
+
+    # Make sure that the default file is correctly set up:
+    sed -i 's|^\s*#*\s*auth_basic .*$|        auth_basic "authorization required";|g' /etc/nginx/sites-available/default
+    sed -i 's|^\s*#*\s*auth_basic_user_file .*$|        auth_basic_user_file /run/nginx/.htaccess/.htpasswd_global;|g' /etc/nginx/sites-available/default
+else
+    # Global Authorization is not enabled, let's ensure that it's set to off
+    sed -i 's|^\s*#*\s*auth_basic .*$|        auth_basic off;|g' /etc/nginx/sites-available/default
+    sed -i 's|^\s*#*\s*auth_basic_user_file .*$|        # auth_basic_user_file /file/here;|g' /etc/nginx/sites-available/default
+fi

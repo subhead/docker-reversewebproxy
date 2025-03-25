@@ -1,0 +1,66 @@
+#!/command/with-contenv bash
+#shellcheck shell=bash disable=SC2154,SC1091
+
+source /scripts/common
+
+"${s6wrap[@]}" echo "Initial setup -- installing BLOCKBOT service"
+
+mv -f /root/blockstats /usr/local/bin >/dev/null 2>&1 || true
+mv -f /root/ipmap /usr/local/bin >/dev/null 2>&1 || true
+
+if [[ -n "$BLOCKBOT" ]]
+then
+  # shellcheck disable=SC2001
+
+  readarray -t -d ',' BLIST_ARR <<< "$BLOCKBOT"
+  for index in "${!BLIST_ARR[@]}"; do
+    BLIST_ARR[index]="${BLIST_ARR[index]//$'\n'/}"
+    #while [[ "${BLIST_ARR[index]: -1}" == "," ]]; do BLIST_ARR[index]="${BLIST_ARR[index]::-1}"; done
+    while [[ "${BLIST_ARR[index]:0:1}" == "," ]] || [[ "${BLIST_ARR[index]:0:1}" == " " ]]; do BLIST_ARR[index]="${BLIST_ARR[index]:1}"; done
+      if [[ "${BLIST_ARR[index]:0:4}" == "http" ]]; then
+        # replace any entry that starts with http by content of the equivalent URL
+        if extra_args="$(curl -sSLf "${BLIST_ARR[index]}" 2>/dev/null)" && [[ "${extra_args:0:1}" != "<" ]]; then 
+          extra_args="${extra_args//$'\n'/,}"
+          readarray -t -d ',' extra_args_arr <<< "$extra_args"
+          "${s6wrap[@]}" echo "Loaded additional BOTBLOCK terms from ${BLIST_ARR[index]}"
+          BLIST_ARR+=( "${extra_args_arr[@]}" )
+        else
+          "${s6wrap[@]}" echo "Skipping bad URL in BOTBLOCK list: \"${BLIST_ARR[index]}\" (\"$extra_args\")"
+        fi
+        unset "BLIST_ARR[index]"
+      fi
+  done
+
+  BLOCKLIST="$(printf "%s|" "${BLIST_ARR[@]}")"  # print BLIST_ARR with OR separator to BLOCKLIST
+  BLOCKLIST="${BLOCKLIST//$'\n'/|}"  # replace any newlines that may have sneaked in with a OR separator
+  BLOCKLIST="${BLOCKLIST//||/|}"  # replace any double OR separators with a single OR
+  while [[ "${BLOCKLIST: -1}" == "|" ]]; do BLOCKLIST="${BLOCKLIST::-1}"; done  # remove any left-over OR separators from the end of the string
+
+  "${s6wrap[@]}" echo "Blocking these bots: $BLOCKLIST"
+  { printf "map \$http_user_agent \$limit_bots {\n"
+    printf "       default 0;\n"
+    printf "       ~*(%s) 1;\n" "${BLOCKLIST// /}"
+    printf "}\n"
+  } >/etc/nginx/blockbot.conf
+else
+  "${s6wrap[@]}" echo "Bot blocking disabled"
+  cp -f /etc/nginx/blockbot.conf.org /etc/nginx/blockbot.conf
+  exit 0
+fi
+
+# If there is a BLOCKBOT_RESPONSECODE, then substitute it.
+# Default code if omitted is 403 (Forbidden). Other codes that may be useful:
+# 402 (payment required, hehe), 404 (doesn't exist), 418 (I am a teapot - used to tell requesters to go away), 410 (Gone), 500 (Internal Server Error),
+# 503 (service unavailable), etc - see https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
+
+[[ -z "$BLOCKBOT_RESPONSECODE" ]] && BLOCKBOT_RESPONSECODE="403"
+
+if [[ "$BLOCKBOT_RESPONSECODE" -lt 100 ]] || [[ "$BLOCKBOT_RESPONSECODE" -gt 999 ]]
+then
+  "${s6wrap[@]}" echo "Response code value for blocked bots \"$BLOCKBOT_RESPONSECODE\" is invalid. Defaulting to \"403\"."
+  BLOCKBOT_RESPONSECODE="403"
+else
+  "${s6wrap[@]}" echo "Setting response code for blocked bots to $BLOCKBOT_RESPONSECODE."
+fi
+# shellcheck disable=SC2016
+sed -i '/\s*if ($limit_bots = 1)/{$!{N;s/\(\s*if ($limit_bots = 1) {\s*\n\s*return \)[0-9]*\(.*\)/\1'"$BLOCKBOT_RESPONSECODE"'\2/;ty;P;D;:y}}' /etc/nginx/sites-available/default >/dev/null 2>&1

@@ -1,0 +1,50 @@
+#!/command/with-contenv bash
+#shellcheck shell=bash disable=SC2154,SC1091
+
+source /scripts/common
+
+"${s6wrap[@]}" echo "Started as an s6 service"
+ACCESS_REPORT_FREQUENCY="${ACCESS_REPORT_FREQUENCY:-60}"
+ACCESSLOG="/var/log/nginx/access.log"
+DBDIR="/run/nginx/.goaccess"
+
+if [[ -z "$ACCESS_REPORT_PAGE" ]] || chk_disabled "$ACCESS_REPORT_PAGE"; then
+    "${s6wrap[@]}" echo "ACCESS_REPORT_PAGE not enabled - continuing without it"
+    exec sleep infinity
+fi
+
+mkdir -p "$DBDIR"
+if compgen -G "$DBDIR/*.db" > /dev/null; then
+   BACKUP_AVAIL=true
+else
+   unset BACKUP_AVAIL
+fi
+
+if ! chk_enabled "$ACCESS_REPORT_PAGE"; then
+    REPORTFILE="$ACCESS_REPORT_PAGE"
+else
+    REPORTFILE="access-report.html"
+fi
+
+if chk_disabled "$ACCESS_REPORT_RESOLVE"; then
+    RESOLVE=""
+else
+    RESOLVE="-d"
+fi
+
+# wait until the access log is available
+while [[ ! -f "$ACCESSLOG" ]]; do
+    sleep 1
+done
+
+"${s6wrap[@]}" echo "Access Reporting Service started. Your report is available at /$REPORTFILE and is updated every $ACCESS_REPORT_FREQUENCY secs."
+
+while true
+do
+    # shellcheck disable=SC2046
+    "${s6wrap[@]}" echo "Updating GoAccess Reports Page at /$REPORTFILE"
+    # shellcheck disable=SC2046
+    "${s6wrap[@]}" nice -n 19 goaccess $(echo "$ACCESSLOG -o /run/nginx/html/$REPORTFILE --no-parsing-spinner --log-format=COMBINED $RESOLVE --db-path=$DBDIR --persist ${BACKUP_AVAIL:+--restore}"|xargs)
+    "${s6wrap[@]}" echo "Done - next update at $(date -d @$(( $(date +%s) + ACCESS_REPORT_FREQUENCY )))"
+    sleep "$ACCESS_REPORT_FREQUENCY" & wait $!
+done
